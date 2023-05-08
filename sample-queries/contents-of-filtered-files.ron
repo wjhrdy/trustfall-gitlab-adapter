@@ -1,0 +1,20 @@
+InputQuery (
+    query: r#"
+{
+  GitlabRepos(last_activity_after: "2023-01-01T12:00:00.000Z") {
+      url @output
+      id @output
+      name @output
+      description @output
+      files(ref: "main") {
+        path @output @filter(op: "regex", value: ["$path_regex"])
+        content @output
+      }
+    }
+}"#,
+    args: {
+        // "url_regex": String("test"),
+        "path_regex": String("requirements.txt"),
+    },
+)
+

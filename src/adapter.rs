@@ -1,28 +1,19 @@
-use std::rc::Rc;
-use std::sync::Arc;
-
 use crate::vertex::{GitlabRepo, RepoFile, Vertex};
+use chrono::{DateTime, Utc};
 use gitlab::api::projects::repository::files::FileRawBuilder;
 use gitlab::api::projects::repository::TreeBuilder;
 use gitlab::api::raw;
 use gitlab::types::Project;
 use gitlab::{
-    api::{
-        paged,
-        projects::{ProjectBuilder, ProjectsBuilder},
-        Client, Paged, Query,
-    },
+    api::{paged, projects::ProjectsBuilder, Query},
     Gitlab, GitlabBuilder,
 };
 use gitlab::{ObjectType, RepoTreeObject};
-use tokio::runtime::Runtime;
-use trustfall::provider::{resolve_coercion_with, resolve_neighbors_with, BasicAdapter};
+
+use trustfall::provider::{resolve_neighbors_with, BasicAdapter};
 use trustfall_core::interpreter::Typename;
 use trustfall_core::{
-    interpreter::{
-        Adapter, ContextIterator, ContextOutcomeIterator, ResolveEdgeInfo, ResolveInfo,
-        VertexIterator,
-    },
+    interpreter::{ContextIterator, ContextOutcomeIterator, VertexIterator},
     ir::{EdgeParameters, FieldValue},
 };
 
@@ -39,32 +30,142 @@ lazy_static! {
 }
 
 #[derive(Debug, Clone)]
-pub struct GitlabAdapter {}
+pub struct GitlabAdapter {
+    page_limit: usize,
+}
 impl Default for GitlabAdapter {
     fn default() -> Self {
         Self::new()
     }
 }
+
+macro_rules! extract_string_param {
+    ($obj:expr, $param:expr) => {
+        $obj.get($param)
+            .map(|v| match v {
+                FieldValue::String(s) => Some(s.clone()),
+                FieldValue::Null => None,
+                _ => unreachable!(),
+            })
+            .unwrap_or(None)
+    };
+}
+
+macro_rules! extract_bool_param {
+    ($obj:expr, $param:expr) => {
+        $obj.get($param)
+            .map(|v| match v {
+                FieldValue::Boolean(s) => Some(s.clone()),
+                FieldValue::Null => None,
+                _ => unreachable!(),
+            })
+            .unwrap_or(None)
+    };
+}
+
+macro_rules! extract_dt_param {
+    ($obj:expr, $param:expr) => {
+        $obj.get($param)
+            .map(|v| match v {
+                // note: this needs to be clone to solve lifetime issues arising
+                // from the generic nature of FieldValue and the fact we need to parse
+                FieldValue::DateTimeUtc(s) => Some(s.clone()),
+                FieldValue::String(s) => Some(
+                    DateTime::parse_from_rfc3339(s)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .unwrap(),
+                ),
+                FieldValue::Null => None,
+                _ => unreachable!(),
+            })
+            .unwrap_or(None)
+    };
+}
+
+#[derive(Debug, Clone)]
+
+pub struct GitlabProjectsGetParams {
+    pub query_string: Option<String>,
+    pub search_namespaces: Option<bool>,
+    pub language: Option<String>,
+    pub membership: Option<bool>,
+    pub last_activity_after: Option<DateTime<Utc>>,
+    pub last_activity_before: Option<DateTime<Utc>>,
+}
+
+impl From<&EdgeParameters> for GitlabProjectsGetParams {
+    fn from(p: &EdgeParameters) -> Self {
+        let query_string = extract_string_param!(p, "query");
+        let search_namespaces = extract_bool_param!(p, "search_namespaces");
+
+        let language = extract_string_param!(p, "language");
+        let membership = extract_bool_param!(p, "membership");
+
+        let last_activity_before = extract_dt_param!(p, "last_activity_before");
+        let last_activity_after = extract_dt_param!(p, "last_activity_after");
+
+        Self {
+            query_string,
+            search_namespaces,
+            language,
+            membership,
+            last_activity_after,
+            last_activity_before,
+        }
+    }
+}
+
 impl GitlabAdapter {
     pub fn new() -> Self {
-        Self {}
+        Self { page_limit: 20 }
     }
 
-    pub fn get_gitlab_repos(language: Option<String>) -> VertexIterator<'static, Vertex> {
-        println!("Getting gitlab repos!");
+    /// Function to enscapsulate the logic of building a ProjectsBuilder, which is a bunch of optional fields,
+    /// hence the `if let Some` statements
+    pub fn build_projects_builder(params: GitlabProjectsGetParams) -> ProjectsBuilder<'static> {
         let mut pb = ProjectsBuilder::default();
 
-        if let Some(lang) = language {
+        if let Some(query_string) = params.query_string {
+            let pb = pb.search(query_string);
+        }
+
+        if let Some(search_namespaces) = params.search_namespaces {
+            let pb = pb.search_namespaces(search_namespaces);
+        }
+
+        if let Some(lang) = params.language {
             let pb = pb.with_programming_language(lang);
         }
 
+        if let Some(membership) = params.membership {
+            let pb = pb.membership(membership);
+        }
+
+        if let Some(last_activity_after) = params.last_activity_after {
+            let pb: &mut ProjectsBuilder = pb.last_activity_after(last_activity_after);
+        }
+
+        if let Some(last_activity_before) = params.last_activity_before {
+            let pb = pb.last_activity_before(last_activity_before);
+        }
+
+        pb
+    }
+
+    pub fn get_gitlab_repos(
+        &self,
+        params: GitlabProjectsGetParams,
+    ) -> VertexIterator<'static, Vertex> {
+        println!("Getting gitlab repos w/ params: {:?}", &params);
+        let pb = Self::build_projects_builder(params);
+
         let projects = pb.build().unwrap();
 
-        let pjs: Vec<Project> = paged(projects, gitlab::api::Pagination::Limit(50))
+        let pjs: Vec<Project> = paged(projects, gitlab::api::Pagination::Limit(self.page_limit))
             .query(&*GITLAB_CLIENT)
             .expect("Failed to get all projects");
 
-        let mut vertices = Vec::new();
+        let mut vertices = Vec::with_capacity(pjs.len());
         for pj in pjs {
             vertices.push(Vertex::GitlabRepo(GitlabRepo {
                 id: pj.id.to_string(),
@@ -118,11 +219,11 @@ impl GitlabAdapter {
                             let contents =    raw(fbe).query(&*GITLAB_CLIENT)
                             .expect("Failed to get raw file contents, does this file exit on the branch?");
 
-                            let content = String::from_utf8(contents).unwrap();
+                            let content = String::from_utf8_lossy(contents.as_slice());
 
                             nodes.push(RepoFile {
                                 path: file.path,
-                                content,
+                                content: content.to_string(),
                             });
                         }
                     }
@@ -145,27 +246,6 @@ impl GitlabAdapter {
             }
         }
     }
-}
-
-macro_rules! impl_item_property {
-    ($contexts:ident, $attr:ident) => {
-        Box::new($contexts.map(|ctx| {
-            let value = ctx
-                .active_vertex()
-                .map(|t| {
-                    if let Some(s) = t.as_gitlab_repo() {
-                        s.$attr.clone()
-                    } else if let Some(j) = vertex.as_repo_file() {
-                        j.$attr.clone().into()
-                    } else {
-                        unreachable!()
-                    }
-                })
-                .into();
-
-            (ctx, value)
-        }))
-    };
 }
 
 macro_rules! impl_property {
@@ -200,21 +280,14 @@ impl BasicAdapter<'static> for GitlabAdapter {
         edge_name: &str,
         parameters: &EdgeParameters,
     ) -> VertexIterator<'static, Self::Vertex> {
-        let language = parameters
-            .get("language")
-            .map(|v| match v {
-                FieldValue::String(s) => Some(s.clone()),
-                FieldValue::Null => None,
-                _ => unreachable!(),
-            })
-            .unwrap_or(None);
-
         match edge_name {
-            "UserGitlabRepos" => GitlabAdapter::get_gitlab_repos(language),
+            "GitlabRepos" => self.get_gitlab_repos(parameters.into()),
             _ => unreachable!("unknown starting edge name: {}", edge_name),
         }
     }
 
+    /// #TODO: currently not needed in our schema, but may need to implement once we
+    /// have edges that need to be joined
     fn resolve_coercion(
         &self,
         contexts: ContextIterator<'static, Self::Vertex>,
@@ -263,26 +336,6 @@ impl BasicAdapter<'static> for GitlabAdapter {
         print!("type_name: {}, edge_name: {}", type_name, edge_name);
 
         match (type_name, edge_name) {
-            ("UserGitlabRepos", "repos") => {
-                let language = parameters
-                    .get("language")
-                    .map(|v| match v {
-                        FieldValue::String(s) => Some(s.clone()),
-                        FieldValue::Null => None,
-                        _ => unreachable!(),
-                    })
-                    .unwrap_or(None);
-
-                let edge_resolver =
-                    move |vertex: &Self::Vertex| -> VertexIterator<'static, Self::Vertex> {
-                        let _repo = vertex.as_repo_list();
-                        // here is where we would use information sitting on the UserGitlabRepos object
-                        // to do edge resolution, in our case though we only care about params since it is the root node
-                        Box::new(GitlabAdapter::get_gitlab_repos(language.clone()))
-                    };
-
-                resolve_neighbors_with(contexts, edge_resolver)
-            }
             ("GitlabRepo", "files") => {
                 let ref_ = parameters
                     .get("ref")

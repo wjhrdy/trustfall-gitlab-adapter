@@ -1,14 +1,18 @@
 schema {
-  query: Query
+  query: RootSchemaQuery
 }
 
-type Query {
-  UserGitlabRepos(language: String): UserGitlabRepos
-}
-
-type UserGitlabRepos {
+type RootSchemaQuery {
   # edges
-  repos: [GitlabRepo!]!
+  GitlabRepos(
+    query: String
+    search_namespace: Boolean
+    language: String
+    membership: Boolean
+    # these are strings for the time being, but they parse as rfcs3339 dts
+    last_activity_after: String
+    last_activity_before: String
+  ): [GitlabRepo!]!
 }
 
 type GitlabRepo {
